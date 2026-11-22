@@ -1,50 +1,151 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+
+import { STEP, VIEW, SCREEN, LOOT_CONF } from './config.js';
+import { LEVELS } from './levels.js';
+import { createWorld } from './world.js';
+import { createGuards, hearNoise, updateGuards } from './guards.js';
+import { createCameras, updateCameras } from './cameras.js';
+import { createPlayer, updatePlayer } from './player.js';
+import { createAlarm } from './alarm.js';
+import { createTools, dropSmoke, fireDart, updateTools } from './tools.js';
+import { createAudio } from './audio.js';
+import { createInput, A_CONFIRM, A_RESTART, A_MUSIC, A_SMOKE, A_DART, A_PAUSE } from './input.js';
+import { createRenderer } from './render.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
-
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
+const shotParam = params.get('shot');
+const shotName = shotParam === 'start' ? 'title' : shotParam === 'end' ? 'getaway' : shotParam;
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : 7;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+const audio = createAudio();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+function announce(message) {
+  if (status) status.textContent = message;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+function createGame() {
+  const game = {
+    seed,
+    levelIndex: 0,
+    level: null,
+    world: null,
+    player: null,
+    guards: [],
+    cameras: [],
+    loot: [],
+    lootTotal: 0,
+    collected: 0,
+    tools: createTools(),
+    smokes: [],
+    alarm: createAlarm(),
+    audio,
+    camera: { x: 0, y: 0 },
+    clock: 0,
+    elapsed: 0,
+    seen: false,
+    session: { alarms: 0, lootValue: 0, items: 0, time: 0 },
+    checkpoint: null,
+  };
+  game.smokes = game.tools.smokes;
+  game.emitNoise = (x, y, radius) => hearNoise(game.guards, x, y, radius);
+  return game;
+}
+
+const game = createGame();
+window.__nightlift = game;
+
+function followPlayer(dt) {
+  const tx = Math.max(0, Math.min(game.world.width - VIEW.width, game.player.x - VIEW.width / 2));
+  const ty = Math.max(0, Math.min(game.world.height - VIEW.height, game.player.y - VIEW.height / 2));
+  const blend = dt >= 1 ? 1 : Math.min(1, dt * 6);
+  game.camera.x += (tx - game.camera.x) * blend;
+  game.camera.y += (ty - game.camera.y) * blend;
+}
+
+function loadLevel(index) {
+  game.levelIndex = index;
+  game.level = LEVELS[index];
+  game.world = createWorld(game.level);
+  game.player = createPlayer(game.level);
+  game.guards = createGuards(game.level);
+  game.cameras = createCameras(game.level);
+  game.loot = game.level.loot.map((item) => ({ ...item, taken: false }));
+  game.lootTotal = game.loot.length;
+  game.collected = 0;
+  game.elapsed = 0;
+  game.seen = false;
+  game.tools = createTools();
+  game.smokes = game.tools.smokes;
+  game.alarm.reset();
+  game.checkpoint = { ...game.session };
+  followPlayer(1);
+}
+
+function stepGame(input, dt) {
+  game.clock += dt;
+  game.elapsed += dt;
+  game.seen = false;
+
+  updatePlayer(game, input, dt);
+  if (updateGuardsStep(dt)) game.seen = true;
+  if (updateCamerasStep(dt)) game.seen = true;
+  updateTools(game, dt);
+  if (game.seen) audio.suspicion();
+  game.alarm.update(game.seen, dt);
+  if (game.alarm.justFull) {
+    game.alarm.justFull = false;
+    game.session.alarms += 1;
+    audio.alarm();
+    announce('Alarm! Guards are converging on your position.');
   }
+  if (game.alarm.justCleared) {
+    game.alarm.justCleared = false;
+    audio.clear();
+    announce('You lost them. Back to the shadows.');
+  }
+  audio.tick(dt);
+  audio.update(dt);
+  followPlayer(dt);
+
+  for (let i = 0; i < game.loot.length; i += 1) {
+    const item = game.loot[i];
+    if (item.taken) continue;
+    if (Math.hypot(game.player.x - item.x, game.player.y - item.y) <= LOOT_CONF.pickupRadius) {
+      item.taken = true;
+      game.collected += 1;
+      game.session.lootValue += item.value;
+      game.session.items += 1;
+      audio.loot();
+      announce(game.collected === game.lootTotal ? 'All loot secured. Get to the van!' : `Loot secured. ${game.lootTotal - game.collected} left.`);
+      if (game.collected === game.lootTotal) audio.clear();
+    }
+  }
+
+  if (game.alarm.over) return 'caught';
+  const van = game.level.van;
+  if (game.collected === game.lootTotal && Math.hypot(game.player.x - (van.x + van.w / 2), game.player.y - (van.y + van.h / 2)) < 46) return 'complete';
+  return null;
+}
+
+function updateGuardsStep(dt) {
+  return updateGuards(game, dt) !== null;
+}
+function updateCamerasStep(dt) {
+  const spotter = updateCameras(game, dt);
+  return spotter !== null;
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
+  loadLevel(name === 'play' ? 2 : name === 'getaway' ? 4 : 0);
+  const screen = stageShot(name, game);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(game, screen);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -54,52 +155,79 @@ function runShot(name) {
 
 function runGame() {
   const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
+  input.setAimConverter((pointer) => renderer.toWorld(pointer.x, pointer.y));
+  let screen = SCREEN.TITLE;
   let accumulator = 0;
   let last = performance.now();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  function newRun() {
+    game.session = { alarms: 0, lootValue: 0, items: 0, time: 0 };
+    loadLevel(0);
+    screen = SCREEN.PLAY;
+    announce('Nightlift. Steal every item, then reach the van.');
   }
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+  function retryLevel() {
+    game.session = { ...game.checkpoint };
+    loadLevel(game.levelIndex);
+    screen = SCREEN.PLAY;
+    announce(`Retrying level ${game.levelIndex + 1}.`);
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+  function nextLevel() {
+    game.session.time += game.elapsed;
+    if (game.levelIndex === LEVELS.length - 1) {
+      screen = SCREEN.GETAWAY;
+      audio.getaway();
+      announce('Clean getaway. All five rooms cleared.');
+    } else {
+      loadLevel(game.levelIndex + 1);
+      screen = SCREEN.PLAY;
+      announce(`Level ${game.levelIndex + 1}: ${game.level.name}.`);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
   }
+
+  loadLevel(0);
+  announce('Nightlift. Press Enter or click to start.');
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
+    if (actions === 0) return;
+    audio.unlock();
+    if (actions & A_MUSIC) announce(audio.toggleMusic() ? 'Music on.' : 'Music off.');
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+    if (screen === SCREEN.TITLE) {
+      if (actions & (A_CONFIRM | A_DART | A_RESTART)) newRun();
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    if (screen === SCREEN.COMPLETE) {
+      if (actions & (A_CONFIRM | A_DART)) nextLevel();
+      else if (actions & A_RESTART) newRun();
+      return;
+    }
+    if (screen === SCREEN.CAUGHT) {
+      if (actions & (A_CONFIRM | A_DART | A_RESTART)) retryLevel();
+      return;
+    }
+    if (screen === SCREEN.GETAWAY) {
+      if (actions & (A_CONFIRM | A_DART | A_RESTART)) newRun();
+      return;
+    }
+    if (screen === SCREEN.PAUSED) {
+      if (actions & (A_PAUSE | A_CONFIRM | A_DART)) screen = SCREEN.PLAY;
+      return;
+    }
+    if (actions & A_PAUSE) {
+      screen = SCREEN.PAUSED;
+      announce('Paused.');
+      return;
+    }
+    if (actions & A_RESTART) {
+      retryLevel();
+      return;
+    }
+    if (actions & A_SMOKE) dropSmoke(game);
+    if (actions & A_DART) fireDart(game, input.aim());
   }
 
   function frame(now) {
@@ -107,28 +235,38 @@ function runGame() {
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    if (screen === SCREEN.PLAY) {
+      while (accumulator >= STEP) {
+        const event = stepGame(input, STEP);
         accumulator -= STEP;
+        if (event === 'caught') {
+          screen = SCREEN.CAUGHT;
+          audio.fail();
+          announce('Caught. Two full alarms. Press R to retry.');
+          break;
+        }
+        if (event === 'complete') {
+          screen = SCREEN.COMPLETE;
+          announce(`Level ${game.levelIndex + 1} clear. Press Enter to continue.`);
+          break;
+        }
       }
     } else {
       accumulator = 0;
+      game.clock += 1 / 60;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(game, screen);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (document.hidden && screen === SCREEN.PLAY) {
+      screen = SCREEN.PAUSED;
       announce('Paused.');
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
+if (shotName) runShot(shotName);
 else runGame();

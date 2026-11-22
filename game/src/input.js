@@ -1,49 +1,98 @@
-// Keyboard and pointer input. Held keys give a steering direction; one-shot presses (start or
-// restart, pause) are queued as bit flags and taken once by the loop, so a press between two
-// frames is never lost and never counted twice.
 
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
+export const A_CONFIRM = 1;
+export const A_RESTART = 2;
+export const A_MUSIC = 4;
+export const A_SMOKE = 8;
+export const A_DART = 16;
+export const A_PAUSE = 32;
 
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
+const MOVE_KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'];
+const TAP_LIMIT = 170;
 
 export function createInput(target) {
-  let left = false;
-  let right = false;
+  const keys = new Set();
+  const taps = new Map();
+  const pointer = { x: 640, y: 360 };
   let actions = 0;
+  let aimConverter = (p) => ({ x: p.x, y: p.y });
 
   window.addEventListener('keydown', (event) => {
-    if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else return;
-    event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    left = false;
-    right = false;
-  });
-  target.addEventListener('pointerdown', () => {
-    actions |= ACTION_CONFIRM;
+    if (keys.has(event.code)) return;
+    keys.add(event.code);
+    taps.set(event.code, performance.now());
+    switch (event.code) {
+      case 'Space':
+      case 'Enter':
+        actions |= A_CONFIRM;
+        break;
+      case 'KeyR':
+        actions |= A_RESTART;
+        break;
+      case 'KeyM':
+        actions |= A_MUSIC;
+        break;
+      case 'KeyP':
+      case 'Escape':
+        actions |= A_PAUSE;
+        break;
+      default:
+        break;
+    }
+    if (MOVE_KEYS.includes(event.code) || event.code === 'ShiftLeft' || event.code === 'ShiftRight') event.preventDefault();
   });
 
+  window.addEventListener('keyup', (event) => {
+    keys.delete(event.code);
+    const started = taps.get(event.code);
+    taps.delete(event.code);
+    if (started === undefined) return;
+    if (performance.now() - started > TAP_LIMIT) return;
+    if (event.code === 'KeyS') actions |= A_SMOKE;
+    if (event.code === 'KeyD') actions |= A_DART;
+  });
+
+  window.addEventListener('blur', () => {
+    keys.clear();
+    taps.clear();
+  });
+
+  target.addEventListener('pointermove', (event) => {
+    const rect = target.getBoundingClientRect();
+    pointer.x = event.clientX - rect.left;
+    pointer.y = event.clientY - rect.top;
+  });
+
+  target.addEventListener('pointerdown', (event) => {
+    const rect = target.getBoundingClientRect();
+    pointer.x = event.clientX - rect.left;
+    pointer.y = event.clientY - rect.top;
+    if (event.button === 2) actions |= A_SMOKE;
+    else if (event.button === 0) {
+      actions |= A_DART;
+      actions |= A_CONFIRM;
+    }
+  });
+
+  target.addEventListener('contextmenu', (event) => event.preventDefault());
+
   return {
-    /** -1 for left, 1 for right, 0 for neither or both. */
-    direction() {
-      return (right ? 1 : 0) - (left ? 1 : 0);
+    move() {
+      const x = (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+      const y = (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0) - (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0);
+      return { x, y };
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
+    sneak() {
+      return keys.has('ShiftLeft') || keys.has('ShiftRight') || keys.has('ControlLeft');
+    },
+    pointer() {
+      return pointer;
+    },
+    setAimConverter(fn) {
+      aimConverter = fn;
+    },
+    aim() {
+      return aimConverter(pointer);
+    },
     takeActions() {
       const taken = actions;
       actions = 0;

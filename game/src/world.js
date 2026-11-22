@@ -1,124 +1,146 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import { TILE } from './config.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+function insideSmoke(x, y, smokes) {
+  for (let i = 0; i < smokes.length; i += 1) {
+    const s = smokes[i];
+    if (s.life > 0) {
+      const dx = x - s.x;
+      const dy = y - s.y;
+      if (dx * dx + dy * dy < s.radius * s.radius) return true;
+    }
+  }
+  return false;
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+export function createWorld(def) {
+  const tiles = def.tiles;
+  const rows = tiles.length;
+  const cols = tiles[0].length;
+  const width = cols * TILE;
+  const height = rows * TILE;
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+  function charAt(col, row) {
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return '#';
+    return tiles[row][col];
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  function solidChar(ch) {
+    return ch === '#' || ch === 'c' || ch === 'p';
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  function solidAt(col, row) {
+    return solidChar(charAt(col, row));
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  function solidPoint(x, y) {
+    return solidAt(Math.floor(x / TILE), Math.floor(y / TILE));
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
+  function collides(x, y, radius) {
+    const minCol = Math.floor((x - radius) / TILE);
+    const maxCol = Math.floor((x + radius) / TILE);
+    const minRow = Math.floor((y - radius) / TILE);
+    const maxRow = Math.floor((y + radius) / TILE);
+    for (let row = minRow; row <= maxRow; row += 1) {
+      for (let col = minCol; col <= maxCol; col += 1) {
+        if (!solidAt(col, row)) continue;
+        const left = col * TILE;
+        const top = row * TILE;
+        const nx = Math.max(left, Math.min(x, left + TILE));
+        const ny = Math.max(top, Math.min(y, top + TILE));
+        const dx = x - nx;
+        const dy = y - ny;
+        if (dx * dx + dy * dy < radius * radius) return true;
       }
     }
-    return events;
+    return false;
   }
 
-  reset();
-  return { state, reset, step };
+  function move(body, dx, dy, radius) {
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 7));
+    const sx = dx / steps;
+    const sy = dy / steps;
+    for (let i = 0; i < steps; i += 1) {
+      if (!collides(body.x + sx, body.y, radius)) body.x += sx;
+      if (!collides(body.x, body.y + sy, radius)) body.y += sy;
+    }
+  }
+
+  function isShadow(x, y) {
+    return charAt(Math.floor(x / TILE), Math.floor(y / TILE)) === 's';
+  }
+
+  function lightAt(x, y) {
+    let best = 0;
+    for (let i = 0; i < def.lights.length; i += 1) {
+      const light = def.lights[i];
+      const dx = x - light.x;
+      const dy = y - light.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < light.r) best = Math.max(best, 1 - d / light.r);
+    }
+    return best;
+  }
+
+  function rayDistance(x, y, angle, maxDist, smokes = []) {
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    const step = 6;
+    for (let d = step; d <= maxDist; d += step) {
+      const px = x + dx * d;
+      const py = y + dy * d;
+      if (solidPoint(px, py) || insideSmoke(px, py, smokes)) return Math.max(0, d - 4);
+    }
+    return maxDist;
+  }
+
+  function lineOfSight(x1, y1, x2, y2, smokes = []) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 1) return true;
+    const steps = Math.ceil(dist / 7);
+    for (let i = 1; i < steps; i += 1) {
+      const t = i / steps;
+      const px = x1 + dx * t;
+      const py = y1 + dy * t;
+      if (solidPoint(px, py) || insideSmoke(px, py, smokes)) return false;
+    }
+    return true;
+  }
+
+  function seesPoint(observer, target, halfAngle, range, smokes = []) {
+    const dx = target.x - observer.x;
+    const dy = target.y - observer.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > range) return false;
+    if (dist > 1) {
+      let diff = Math.atan2(dy, dx) - observer.angle;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      if (Math.abs(diff) > halfAngle) return false;
+    }
+    return lineOfSight(observer.x, observer.y, target.x, target.y, smokes);
+  }
+
+  return {
+    def,
+    tiles,
+    cols,
+    rows,
+    width,
+    height,
+    charAt,
+    solidAt,
+    solidPoint,
+    collides,
+    move,
+    isShadow,
+    lightAt,
+    rayDistance,
+    lineOfSight,
+    seesPoint,
+    insideSmoke: (x, y, smokes) => insideSmoke(x, y, smokes),
+  };
 }
